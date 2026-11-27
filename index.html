@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Pickleball 3D</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b3d2e">
+<link rel="manifest" href="manifest.json">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#8ec5e8;font-family:system-ui,sans-serif;touch-action:none}
+  canvas{display:block}
+  #hud{position:fixed;top:12px;left:0;right:0;text-align:center;color:#fff;font-weight:700;text-shadow:0 1px 4px #000a;pointer-events:none}
+  #score{font-size:30px} #msg{font-size:20px;min-height:26px}
+  #menu{position:fixed;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:#0b3d2ee6;color:#fff;text-align:center;padding:16px}
+  #menu h1{margin:0 0 8px} #menu p{margin:0;max-width:340px}
+  button,input{font:inherit;font-size:18px;padding:12px 18px;border-radius:10px;border:0}
+  button{background:#ffd23f;color:#1a1a1a;font-weight:700;cursor:pointer;min-width:270px}
+  button:focus-visible,input:focus-visible{outline:3px solid #fff;outline-offset:2px}
+  input{width:90px;text-align:center;text-transform:uppercase}
+  #join{min-width:0}
+  #hit{position:fixed;right:max(20px,env(safe-area-inset-right));bottom:max(24px,env(safe-area-inset-bottom));width:104px;height:104px;min-width:0;padding:0;border-radius:50%;font-size:24px;box-shadow:0 4px 14px #0007;touch-action:none;user-select:none;-webkit-user-select:none}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="hud"><div id="score"></div><div id="msg" role="status"></div></div>
+<button id="hit" hidden>HIT</button>
+<div id="menu">
+  <h1>Pickleball 3D</h1>
+  <button id="solo">Solo vs computer</button>
+  <button id="local">2 players on this device</button>
+  <button id="host">Host online game</button>
+  <div><label>Room code <input id="code" maxlength="4" autocomplete="off"></label> <button id="join">Join</button></div>
+  <p id="status" role="status"></p>
+  <p>Move with your mouse or finger. Click or press Space to hit when the ball is near you; on a phone, drag to move and press the HIT button. Stand behind the bounce, and hit the ball off-centre to angle it.</p>
+  <p>On one device: drag in your own half and tap with another finger to hit. Keyboard: arrows + Space (near side), WASD + F (far side).</p>
+</div>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+
+// ---------- rules + physics (no drawing in here) ----------
+const HW=3.05, HL=6.7, NET=.91, KITCHEN=2.13, G=9.8, BR=.09, REACH=1.2; // metres, real court size
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v)), side=i=>i?-1:1;        // player 0 plays the +z half
+const S={ p:[{x:0,z:5.5,tx:0,tz:5.5,speed:5.5},{x:0,z:-5.5,tx:0,tz:-5.5,speed:5.5}],
+          b:{x:0,y:1,z:0,vx:0,vy:0,vz:0}, land:{x:0,z:0}, err:0 };
+function reset(){ Object.assign(S,{live:false,last:-1,bounces:0,hits:0,server:0,score:[0,0],timer:1.5,msg:'',over:false,shot:'',back:false,sw:[0,0],kind:['',''],backs:[false,false]});
+  for(const p of S.p){ p.cool=0; p.swingT=0; } }
+reset();
+
+// Aim the ball at a spot on the ground, slowing the shot until it clears the net.
+function launch(tx,tz,speed){
+  const b=S.b, d=Math.hypot(tx-b.x,tz-b.z);
+  for(let T=d/speed;;T+=.05){
+    const vy=(BR-b.y)/T+G*T/2, tn=-b.z/(tz-b.z)*T;
+    if(b.y+vy*tn-G*tn*tn/2>NET+.25||T>3){
+      b.vx=(tx-b.x)/T; b.vz=(tz-b.z)/T; b.vy=vy;
+      const h=Math.hypot(b.vx,b.vz);
+      S.land={x:tx+b.vx/h*1.2,z:tz+b.vz/h*1.2};   // where a receiver should stand: just past the bounce
+      S.err=(Math.random()-.5)*1.9*REACH; return;       // computer's positioning error: wide angles, some shots out
+    }
+  }
+}
+
+function point(w,why){
+  S.live=false; S.score[w]++; S.server=w; S.timer=1.5; S.msg=why;
+  const [a,c]=S.score;
+  if(Math.max(a,c)>=11&&Math.abs(a-c)>=2){ S.over=true; S.timer=5; }
+}
+
+// Is the ball close enough for player i to reach, and would hitting it now be legal?
+function near(i){ const p=S.p[i], b=S.b; return S.live&&S.last!==i&&Math.sign(b.z)===side(i)&&b.y>.25&&b.y<2.4&&Math.hypot(b.x-p.x,b.z-p.z)<REACH; }
+// Legal hit: after one bounce, or a volley once serve and return have both bounced and you're out of the kitchen.
+const legal=i=>S.bounces||(S.hits>=3&&Math.abs(S.p[i].z)>KITCHEN);
+function mark(i,kind,back){ S.sw[i]++; S.kind[i]=kind; S.backs[i]=back; }   // tells the drawing code to play a swing
+// A human pressed hit. The swing connects if the ball is in reach now or arrives within the next 0.2s.
+function swing(i){
+  const p=S.p[i];
+  if(S.over||p.cool>0) return;
+  p.cool=.45; p.swingT=.2; mark(i,'Drive',(S.b.x-p.x)*side(i)<0);
+  if(near(i)&&!legal(i)) S.msg=S.hits<3?'Let it bounce first':'No volleys in the kitchen';
+}
+
+function step(dt){
+  if(S.over){ if((S.timer-=dt)<=0) reset(); return; }
+  S.p.forEach((p,i)=>{                       // walk toward the target, kept on your own half
+    p.cool-=dt; p.swingT-=dt;
+    const s=side(i), dx=clamp(p.tx,-HW-1.5,HW+1.5)-p.x, dz=s*clamp(s*p.tz,.4,HL+1.5)-p.z, d=Math.hypot(dx,dz);
+    if(d>1e-6){ const m=Math.min(d,p.speed*dt)/d; p.x+=dx*m; p.z+=dz*m; }
+  });
+  const b=S.b;
+  if(!S.live){                               // server holds the ball, then serves cross-court
+    const sv=S.p[S.server]; b.x=sv.x; b.y=1; b.z=sv.z;
+    if((S.timer-=dt)<=0){
+      S.live=true; S.last=S.server; S.bounces=0; S.hits=1; S.msg=''; S.shot='Serve'; mark(S.server,'Serve',false);
+      launch(clamp(-sv.x*.6,-2,2),-side(S.server)*5,11);
+    }
+    return;
+  }
+  b.x+=b.vx*dt; b.z+=b.vz*dt; b.y+=b.vy*dt-G*dt*dt/2; b.vy-=G*dt;
+  if(b.y<=BR){
+    const good=Math.abs(b.x)<=HW&&Math.abs(b.z)<=HL&&Math.sign(b.z)===-side(S.last);
+    if(S.bounces||!good) return point(S.bounces?S.last:1-S.last, S.bounces?'':'Out!');
+    S.bounces=1; b.y=BR; b.vy*=-.72; b.vx*=.8; b.vz*=.8;
+  }
+  const i=1-S.last, p=S.p[i], s=side(i), off=b.x-p.x;
+  if(near(i)&&legal(i)&&(p.auto||p.swingT>0)){   // the computer swings by itself; a human must have pressed hit
+    // The shot is chosen by the situation: high ball = smash, you at the net = dink, opponent at the net = lob.
+    const mine=Math.abs(p.z), theirs=Math.abs(S.p[S.last].z);
+    const [shot,speed,depth]= b.y>1.4 ? ['Smash',19,4.6] : mine<3.2 ? ['Dink',5,1.3] : theirs<3.2 ? ['Lob',5.5,5.8]
+                            : S.bounces ? ['Drive',10,clamp(mine*.85,3,5.6)] : ['Volley',13,clamp(mine*.85,3,5.6)];
+    S.shot=shot; S.back=off*s<0;             // ball on the non-paddle side = backhand
+    S.msg=shot==='Smash'?'Smash!':(S.back?'Backhand ':'Forehand ')+shot.toLowerCase();
+    S.last=i; S.bounces=0; S.hits++; p.swingT=0; mark(i,shot,S.back);
+    launch(off/REACH*3.4, -s*depth, speed);  // edge-of-reach hits fly wide and out
+  }
+}
+
+function ai(i){
+  const p=S.p[i], s=side(i);
+  // Receiving: stand just past the bounce, but get under a lob to smash it. Otherwise wait deep, or sometimes rush the net.
+  if(S.live&&S.last!==i){ p.tx=S.land.x+S.err; p.tz=S.land.z-(S.shot==='Lob'?s*1.2:0); }
+  else { p.tx=0; p.tz=s*(S.hits>=3&&S.err>.3?2.6:5); }
+}
+
+function selfCheck(){
+  const ok=(c,m)=>{ if(!c) throw new Error('self-check failed: '+m); };
+  const b=S.b; Object.assign(b,{x:1,y:1,z:5}); launch(-2,-4,9);
+  let netY=0;
+  for(let n=0;b.y>BR&&n<600;n++){ const z0=b.z, dt=1/60;
+    b.x+=b.vx*dt; b.z+=b.vz*dt; b.y+=b.vy*dt-G*dt*dt/2; b.vy-=G*dt; if(z0>0&&b.z<=0) netY=b.y; }
+  ok(Math.hypot(b.x+2,b.z+4)<.25,'shot lands on target'); ok(netY>NET,'shot clears the net');
+  reset(); S.p[0].speed=S.p[1].speed=3.5; S.p[0].auto=S.p[1].auto=true;
+  const shots={}; let t=0, h=0;
+  for(;!S.over&&t<36000;t+=1/60){ ai(0); ai(1); step(1/60); if(S.hits>h&&S.hits>1) shots[S.shot]=(shots[S.shot]|0)+1; h=S.hits; }
+  const [a,c]=S.score; ok(S.over&&Math.max(a,c)>=11&&Math.abs(a-c)>=2,`full game finishes (${a}-${c})`);
+  return `self-check ok: ${a}-${c} after ${Math.round(t)}s of play, shots ${JSON.stringify(shots)}`;
+}
+
+// ---------- drawing ----------
+const $=id=>document.getElementById(id);
+const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.shadowMap.enabled=true;
+renderer.setPixelRatio(Math.min(devicePixelRatio,2)); document.body.prepend(renderer.domElement);
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x8ec5e8);
+const camera=new THREE.PerspectiveCamera(55,1,.5,120);
+scene.add(new THREE.HemisphereLight(0xffffff,0x4a7a5a,1.6));
+const sun=new THREE.DirectionalLight(0xffffff,2); sun.position.set(5,14,4); sun.castShadow=true;
+sun.shadow.mapSize.set(2048,2048); Object.assign(sun.shadow.camera,{left:-12,right:12,top:12,bottom:-12}); scene.add(sun);
+const mat=c=>new THREE.MeshLambertMaterial({color:c});
+const add=(geo,m,x=0,y=0,z=0)=>{ const o=new THREE.Mesh(geo,m); o.position.set(x,y,z); scene.add(o); return o; };
+const flat=(w,d,c,x,z,y)=>{ const o=add(new THREE.PlaneGeometry(w,d),mat(c),x,y,z); o.rotation.x=-Math.PI/2; o.receiveShadow=true; };
+flat(80,80,0x3d8b5f,0,0,0);
+flat(HW*2,HL*2,0x2f6db5,0,0,.01);
+for(const s of [1,-1]){
+  flat(HW*2,KITCHEN,0x2e9e7a,0,s*KITCHEN/2,.02);
+  flat(.05,HL*2,0xffffff,s*HW,0,.03); flat(HW*2,.05,0xffffff,0,s*HL,.03);
+  flat(HW*2,.05,0xffffff,0,s*KITCHEN,.03); flat(.05,HL-KITCHEN,0xffffff,0,s*(HL+KITCHEN)/2,.03);
+}
+add(new THREE.PlaneGeometry(HW*2+.6,NET),new THREE.MeshLambertMaterial({color:0xffffff,transparent:true,opacity:.45,side:THREE.DoubleSide}),0,NET/2,0);
+add(new THREE.BoxGeometry(HW*2+.6,.06,.04),mat(0xffffff),0,NET,0);
+const men=[0xffb703,0xe63946].map((c,i)=>{
+  // A person built from simple shapes; limbs hang from pivots (hips, shoulders) so they can swing.
+  const g=new THREE.Group(), skin=mat(0xe8b88f), dark=mat(0x26324a);
+  const part=(parent,geo,m,x,y,z=0)=>{ const o=new THREE.Mesh(geo,m); o.position.set(x,y,z); parent.add(o); return o; };
+  const pivot=(x,y)=>{ const o=new THREE.Group(); o.position.set(x,y,0); g.add(o); return o; };
+  part(g,new THREE.CapsuleGeometry(.18,.34),mat(c),0,1.17);                       // shirt
+  part(g,new THREE.CylinderGeometry(.19,.2,.26),dark,0,.88);                      // shorts
+  part(g,new THREE.SphereGeometry(.14),skin,0,1.64);                              // head
+  part(g,new THREE.SphereGeometry(.15,16,10,0,Math.PI*2,0,Math.PI/2),mat(0x3b2a1e),0,1.66); // hair
+  const limbs=[-1,1].map(s=>{
+    const leg=pivot(s*.1,.84), arm=pivot(s*.27,1.4);
+    part(leg,new THREE.CapsuleGeometry(.075,.62),skin,0,-.4);
+    part(leg,new THREE.BoxGeometry(.13,.09,.26),mat(0xffffff),0,-.8,-.05);        // shoe
+    part(arm,new THREE.CapsuleGeometry(.055,.46),skin,0,-.28);
+    arm.rotation.z=s*.12;
+    return {leg,arm};
+  });
+  const hand=limbs[1].arm;                                                        // paddle in the right hand
+  part(hand,new THREE.CylinderGeometry(.02,.02,.14),dark,0,-.64);
+  const face=part(hand,new THREE.CylinderGeometry(.15,.15,.025,20),mat(0x1b1b1b),0,-.84);
+  face.rotation.x=Math.PI/2; face.scale.x=.8;
+  g.traverse(o=>o.castShadow=true); if(i) g.rotation.y=Math.PI; scene.add(g);
+  g.userData={limbs,phase:0,amp:0,swing:0,px:0,pz:0,seenSw:0,kind:'Drive'}; return g;
+});
+// Realistic players: rigged models with a run clip. The shape-built figures above stay as the fallback
+// if a model fails to load (for example when the page is opened as a file instead of from a web address).
+['man','woman'].forEach((name,i)=>new GLTFLoader().load(`models/${name}.glb`,g=>{
+  const root=men[i], u=root.userData, m=g.scene;
+  root.children.forEach(c=>c.visible=false);
+  m.rotation.y=Math.PI;                       // models face +z; players face the net
+  m.traverse(o=>{ if(o.isMesh){ o.castShadow=true; o.frustumCulled=false; o.material.metalness=0; o.material.roughness=.9; } });
+  root.add(m);
+  u.mixer=new THREE.AnimationMixer(m); u.run=u.mixer.clipAction(g.animations[0]); u.run.play();
+  u.bones=['Spine','LeftArm','RightArm','RightForeArm'].map(n=>m.getObjectByName(n));
+  u.keep=u.bones.map(b=>b.quaternion.clone());
+  const pad=new THREE.Group(), dark=mat(0x1b1b1b);
+  const handle=new THREE.Mesh(new THREE.CylinderGeometry(.02,.02,.16),dark); handle.position.y=.12;
+  const face=new THREE.Mesh(new THREE.CylinderGeometry(.15,.15,.025,20),dark); face.position.y=.34; face.rotation.x=Math.PI/2; face.scale.x=.8;
+  pad.add(handle,face); pad.traverse(o=>o.castShadow=true);
+  pad.scale.setScalar(100);                   // the skeleton is in centimetres
+  m.getObjectByName('RightHand').add(pad);
+}));
+const AX=new THREE.Vector3(1,0,0), AY=new THREE.Vector3(0,1,0), AZ=new THREE.Vector3(0,0,1);
+const qa=new THREE.Quaternion(), qb=new THREE.Quaternion(), qr=new THREE.Quaternion(), va=new THREE.Vector3();
+function turn(bone,axis,angle,root){          // rotate a bone about an axis given in the player's own frame
+  root.getWorldQuaternion(qb); qr.setFromAxisAngle(va.copy(axis).applyQuaternion(qb),angle);
+  bone.parent.getWorldQuaternion(qa);
+  bone.quaternion.premultiply(qb.copy(qa).invert().multiply(qr).multiply(qa));
+}
+// Sound effects are synthesised, so there are no audio files to load.
+let ac; for(const ev of ['pointerdown','keydown']) addEventListener(ev,()=>{ ac??=new AudioContext(); ac.resume(); });
+function beep(f,dur,vol=.2,type='square',f2=f,delay=0){
+  if(!ac) return;
+  const o=ac.createOscillator(), g=ac.createGain(), t=ac.currentTime+delay;
+  o.type=type; o.frequency.setValueAtTime(f,t); o.frequency.exponentialRampToValueAtTime(f2,t+dur);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.001,t+dur);
+  o.connect(g).connect(ac.destination); o.start(t); o.stop(t+dur);
+}
+// A pickleball hit is a short hollow "pock": a burst of noise through a narrow filter plus a quick ping.
+let noise;
+function pop(f,vol,dur=.07){
+  if(!ac) return;
+  if(!noise){ noise=ac.createBuffer(1,ac.sampleRate*.3,ac.sampleRate); const d=noise.getChannelData(0); for(let k=0;k<d.length;k++) d[k]=Math.random()*2-1; }
+  const t=ac.currentTime, src=ac.createBufferSource(), bp=ac.createBiquadFilter(), g=ac.createGain();
+  src.buffer=noise; bp.type='bandpass'; bp.frequency.value=f; bp.Q.value=6;
+  g.gain.setValueAtTime(vol*3,t); g.gain.exponentialRampToValueAtTime(.001,t+dur);
+  src.connect(bp).connect(g).connect(ac.destination); src.start(t); src.stop(t+dur);
+  beep(f,dur*.6,vol*.7,'sine',f*.8);
+}
+// Swing shapes. Each shot has a wind-up pose and a follow-through pose, as angles for
+// [torso twist, torso lean, arm forward/up, arm sweep, arm out to the side, elbow, left arm up].
+const POSES={
+  Drive: [[-.7,0,.2,-1.1,1.1,.3,.7],  [.7,-.15,.4,1.8,1.2,.5,.1]],
+  Back:  [[.8,0,.3,2.2,.9,.5,0],      [-.6,-.1,.2,-.5,1.4,0,.4]],
+  Smash: [[-.3,.3,3.4,0,.15,1.4,2.4], [.35,-.55,.8,.3,0,0,.2]],
+  Dink:  [[-.1,-.2,-.35,0,.15,.2,.2], [0,-.25,.8,0,.15,.5,.2]],
+  Lob:   [[-.2,-.15,-.9,0,.15,0,.3],  [0,.2,2.4,0,.15,.3,.3]],
+  Volley:[[-.25,0,.9,-.4,.6,1.1,.5],  [.15,-.1,1.3,.5,.5,.2,.4]],
+};
+POSES.Serve=POSES.Lob;
+const ease=x=>x*x*(3-2*x);
+// t runs 0..1: wind up (0-0.2), strike through (0.2-0.5), recover (0.5-1).
+const pose=(k,t)=>{ const [W,F]=POSES[k]; return W.map((w,j)=>t<.2?w*ease(t/.2):t<.5?w+(F[j]-w)*ease((t-.2)/.3):F[j]*(1-ease((t-.5)/.5))); };
+let seenHits=0, seenBounce=0, seenTotal=0, seenOver=false;
+function animate(dt){
+  const hit=S.hits!==seenHits&&S.hits>0; seenHits=S.hits;
+  if(hit){ const k=S.shot; if(k==='Smash') pop(1000,.5,.1); else pop(k==='Dink'?1350:k==='Lob'?1150:1220,k==='Dink'?.12:.3); }
+  if(S.bounces&&!seenBounce) pop(620,.14,.045);                 // ball on court: lower and duller than the paddle
+  seenBounce=S.bounces;
+  const total=S.score[0]+S.score[1];
+  if(total>seenTotal){ if(S.msg==='Out!') beep(170,.3,.2,'sawtooth',110); else { beep(660,.12,.15,'sine'); beep(880,.2,.15,'sine',880,.11); } }
+  seenTotal=total;
+  if(S.over&&!seenOver) [523,659,784,1047].forEach((f,n)=>beep(f,.25,.18,'triangle',f,.35+n*.15));
+  seenOver=S.over;
+  S.p.forEach((p,i)=>{
+    const u=men[i].userData, d=Math.hypot(p.x-u.px,p.z-u.pz); u.px=p.x; u.pz=p.z;
+    if(S.sw[i]!==u.seenSw){                  // a new swing started (a hit, a serve, or a miss)
+      u.seenSw=S.sw[i];
+      if(S.sw[i]){ u.swing=1; u.smash=S.kind[i]==='Smash'; u.back=S.backs[i]; u.kind=u.back&&!u.smash?'Back':S.kind[i]; if(!hit) pop(300,.04,.16); }
+    }
+    u.phase+=d*5; u.amp+=((d>.001?1:0)-u.amp)*.2; u.swing=Math.max(0,u.swing-dt*2.4);
+    const run=Math.sin(u.phase)*.8*u.amp;
+    u.limbs[0].leg.rotation.x=run; u.limbs[1].leg.rotation.x=-run; u.limbs[0].arm.rotation.x=-run;
+    const sw=Math.sin(u.swing*Math.PI), arm=u.limbs[1].arm;      // fallback figure: simple swing
+    arm.rotation.x=.5+sw*(u.smash?2.7:u.back?.9:1.7);
+    arm.rotation.z=.12-(u.back&&!u.smash?sw*1.3:0);
+    if(u.mixer){                              // run clip while moving; standing = arms lowered from the A-pose
+      // The mixer skips writing a bone whose value hasn't changed, so undo last frame's adjustments first.
+      u.bones.forEach((b,j)=>b.quaternion.copy(u.keep[j]));
+      u.run.setEffectiveWeight(Math.max(u.amp,.001)); u.mixer.update(dt);
+      u.bones.forEach((b,j)=>u.keep[j].copy(b.quaternion));
+      const idle=1-u.amp, root=men[i], [spine,armL,armR,fore]=u.bones;
+      const [twist,lean,ax,ay,az,elbow,left]=u.swing>0?pose(u.kind,1-u.swing):[0,0,0,0,0,0,0];
+      turn(spine,AY,twist,root); turn(spine,AX,lean,root);
+      turn(armL,AZ,.42*idle,root); turn(armL,AX,left,root);
+      turn(armR,AZ,az-.42*idle,root); turn(armR,AX,ax,root); turn(armR,AY,ay,root);
+      turn(fore,AX,elbow,root);
+    }
+  });
+}
+const ball=add(new THREE.SphereGeometry(BR),mat(0xe8ff4a)); ball.castShadow=true;
+
+let mode=null, me=0, peer=null, conn=null;   // mode: solo | local | host | guest
+function fit(){
+  const a=innerWidth/innerHeight;
+  camera.aspect=a; camera.fov=a<1&&mode!=='local'?85:55; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+}
+addEventListener('resize',fit);
+function view(){
+  if(mode==='local'){ camera.position.set(0,19,0); camera.up.set(0,0,-1); }   // top-down, a player at each end
+  else { camera.position.set(0,6,13*side(me)); camera.up.set(0,1,0); }
+  camera.lookAt(0,0,0); fit();
+}
+const setText=(el,t)=>{ if(el.textContent!==t) el.textContent=t; };
+function draw(dt){
+  animate(dt);
+  S.p.forEach((p,i)=>men[i].position.set(p.x,0,p.z));
+  ball.position.set(S.b.x,S.b.y,S.b.z);
+  if(mode){
+    const names=mode==='local'?['Near','Far']:me?['Opponent','You']:['You','Opponent'];
+    const w=S.score[0]>S.score[1]?0:1;
+    setText($('score'),`${names[0]} ${S.score[0]} – ${S.score[1]} ${names[1]}`);
+    setText($('msg'),S.over?(mode==='local'?`${names[w]} side wins!`:w===me?'You win!':'You lose'):String(S.msg||''));
+  }
+  renderer.render(scene,camera);
+}
+
+// ---------- input ----------
+const ray=new THREE.Raycaster(), ndc=new THREE.Vector2(), pt=new THREE.Vector3(), floor=new THREE.Plane(new THREE.Vector3(0,1,0),0);
+const mover=[null,null];                      // which finger steers each player; any extra tap is just a hit
+function hitKey(i){ if(mode==='guest'){ if(conn?.open) conn.send({swing:1}); } else swing(i); }
+function aim(e){
+  if(!mode) return;
+  ndc.set(e.clientX/innerWidth*2-1,-e.clientY/innerHeight*2+1); ray.setFromCamera(ndc,camera);
+  if(!ray.ray.intersectPlane(floor,pt)) return;
+  const i=mode==='guest'||(mode==='local'&&pt.z<0)?1:0;          // on one device, each half steers its own player
+  if(e.type==='pointerdown'){ if(mover[i]===null) mover[i]=e.pointerId; if($('hit').hidden) hitKey(i); }   // with the HIT button showing, touching the court only moves
+  if(e.pointerType!=='mouse'&&mover[i]!==e.pointerId) return;
+  if(mode==='guest'){ if(conn?.open) conn.send({x:pt.x,z:pt.z}); return; }
+  S.p[i].tx=pt.x; S.p[i].tz=pt.z;
+}
+addEventListener('pointermove',aim); addEventListener('pointerdown',aim);
+$('hit').addEventListener('pointerdown',e=>{ e.stopPropagation(); e.preventDefault(); hitKey(me); });
+for(const ev of ['pointerup','pointercancel']) addEventListener(ev,e=>mover.forEach((id,i)=>{ if(id===e.pointerId) mover[i]=null; }));
+const keys={}; addEventListener('keyup',e=>keys[e.code]=0);
+addEventListener('keydown',e=>{
+  keys[e.code]=1;
+  if(!mode||e.repeat) return;
+  if(e.code==='Space'||e.code==='Enter'){ e.preventDefault(); hitKey(mode==='guest'?1:0); }
+  if(e.code==='KeyF'&&mode==='local') hitKey(1);
+});
+function keyMove(i,l,r,u,d){
+  const x=(keys[r]|0)-(keys[l]|0), z=(keys[d]|0)-(keys[u]|0), p=S.p[i];
+  if(x||z){ p.tx=p.x+x*2; p.tz=p.z+z*2; }
+}
+
+// ---------- modes + online ----------
+function start(m){
+  mode=m; me=m==='guest'?1:0; reset();
+  S.p[1].speed=m==='solo'?3.5:5.5; S.p[0].auto=false; S.p[1].auto=m==='solo';
+  $('menu').hidden=true; $('menu').style.display='none'; view();
+  $('hit').hidden=!(matchMedia('(pointer:coarse)').matches&&m!=='local');   // phones and tablets get a HIT button
+}
+function back(text){
+  mode=null; conn=null; peer?.destroy(); peer=null; $('hit').hidden=true;
+  $('menu').style.display=''; $('menu').hidden=false; $('status').textContent=text; $('score').textContent=$('msg').textContent='';
+}
+const netError=e=>back(e.type==='peer-unavailable'?'No game found with that code.':'Connection problem ('+e.type+'). Try again.');
+$('solo').onclick=()=>start('solo');
+$('local').onclick=()=>start('local');
+$('host').onclick=()=>{
+  if(!window.Peer) return $('status').textContent='Online play needs an internet connection.';
+  const code=Array.from({length:4},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ'[Math.random()*24|0]).join('');
+  peer?.destroy(); peer=new Peer('pickle3d-'+code);
+  peer.on('open',()=>$('status').textContent=`Room code: ${code}. Waiting for your friend to join…`);
+  peer.on('error',netError);
+  peer.on('connection',c=>{
+    if(conn?.open) return c.close();          // one guest only
+    conn=c;
+    c.on('open',()=>start('host'));
+    c.on('data',d=>{ if(d?.swing) swing(1); else if(Number.isFinite(d?.x)&&Number.isFinite(d?.z)){ S.p[1].tx=d.x; S.p[1].tz=d.z; } });
+    c.on('close',()=>back('Your friend left the game.'));
+  });
+};
+$('join').onclick=()=>{
+  const code=$('code').value.trim().toUpperCase();
+  if(!/^[A-Z]{4}$/.test(code)) return $('status').textContent='Type the 4-letter room code first.';
+  if(!window.Peer) return $('status').textContent='Online play needs an internet connection.';
+  $('status').textContent='Connecting…';
+  peer?.destroy(); peer=new Peer();
+  peer.on('error',netError);
+  peer.on('open',()=>{
+    conn=peer.connect('pickle3d-'+code,{serialization:'json'});
+    conn.on('open',()=>start('guest'));
+    conn.on('data',d=>{                        // host owns the game; guest just shows it
+      d.p.forEach((q,i)=>{ S.p[i].x=+q.x; S.p[i].z=+q.z; });
+      Object.assign(S.b,{x:+d.b.x,y:+d.b.y,z:+d.b.z}); S.score=[+d.score[0],+d.score[1]]; S.over=!!d.over; S.msg=d.msg;
+      S.hits=d.hits|0; S.last=d.last===1?1:0; S.bounces=d.bounces|0; S.shot=String(d.shot); S.back=!!d.back;
+      S.sw=[d.sw[0]|0,d.sw[1]|0]; S.kind=d.kind.map(k=>POSES[k]?k:'Drive'); S.backs=d.backs.map(Boolean);
+    });
+    conn.on('close',()=>back('The host left the game.'));
+  });
+};
+
+// shortcut: host sends the whole state every frame and the guest draws it as-is (no smoothing), and a host tab
+// in the background pauses the match. Upgrade to interpolation + a fixed tick if online play feels jumpy.
+let prev=performance.now();
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min((now-prev)/1000,.05); prev=now;
+  if(mode&&mode!=='guest'){
+    if(mode==='solo') ai(1);
+    keyMove(0,'ArrowLeft','ArrowRight','ArrowUp','ArrowDown');
+    if(mode==='local') keyMove(1,'KeyA','KeyD','KeyW','KeyS');
+    step(dt);
+    if(mode==='host'&&conn?.open) conn.send({p:S.p.map(({x,z})=>({x,z})),b:S.b,score:S.score,over:S.over,msg:S.msg,hits:S.hits,last:S.last,bounces:S.bounces,shot:S.shot,back:S.back,sw:S.sw,kind:S.kind,backs:S.backs});
+  }
+  draw(dt);
+}
+if(location.search==='?test'){ let r; try{ r=selfCheck(); }catch(e){ r=e.message; } console.log(r); $('status').textContent=r; reset(); }
+if(location.search.startsWith('?debug')) window.dbg={camera,men,S,swing};   // for close-up inspection from the console
+view(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
