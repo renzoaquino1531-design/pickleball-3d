@@ -30,8 +30,11 @@
 <div id="menu">
   <h1>Pickleball 3D</h1>
   <button id="solo">Solo vs computer</button>
+  <button id="solo2">Doubles vs computer</button>
   <button id="local">2 players on this device</button>
-  <button id="host">Host online game</button>
+  <button id="host">Host online: 1 v 1</button>
+  <button id="host4">Host online: doubles (up to 4)</button>
+  <button id="go" hidden>Start the doubles match</button>
   <div><label>Room code <input id="code" maxlength="4" autocomplete="off"></label> <button id="join">Join</button></div>
   <p id="status" role="status"></p>
   <p>Move with your mouse or finger. Click or press Space to hit when the ball is near you; on a phone, drag to move and press the HIT button. Stand behind the bounce, and hit the ball off-centre to angle it.</p>
@@ -45,11 +48,15 @@ import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 
 // ---------- rules + physics (no drawing in here) ----------
 const HW=3.05, HL=6.7, NET=.91, KITCHEN=2.13, G=9.8, BR=.09, REACH=1.2; // metres, real court size
-const clamp=(v,a,b)=>Math.min(b,Math.max(a,v)), side=i=>i?-1:1;        // player 0 plays the +z half
-const S={ p:[{x:0,z:5.5,tx:0,tz:5.5,speed:5.5},{x:0,z:-5.5,tx:0,tz:-5.5,speed:5.5}],
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v)), side=i=>i%2?-1:1;   // players 0 and 2 are one team (+z half), 1 and 3 the other
+const S={ p:[0,1,2,3].map(()=>({x:0,z:0,tx:0,tz:0,speed:5.5})), n:2,   // n = players on court: 2 singles, 4 doubles
           b:{x:0,y:1,z:0,vx:0,vy:0,vz:0}, land:{x:0,z:0}, err:0 };
-function reset(){ Object.assign(S,{live:false,last:-1,bounces:0,hits:0,server:0,score:[0,0],timer:1.5,msg:'',over:false,shot:'',back:false,sw:[0,0],kind:['',''],backs:[false,false]});
-  for(const p of S.p){ p.cool=0; p.swingT=0; } }
+const homeX=i=>S.n===4?(i<2?-1.5:1.5):0;     // doubles partners start left and right
+function reset(){
+  Object.assign(S,{live:false,last:-1,bounces:0,hits:0,server:0,serverP:0,score:[0,0],timer:1.5,msg:'',over:false,shot:'',back:false,
+                   sw:[0,0,0,0],kind:['','','',''],backs:[false,false,false,false]});
+  S.p.forEach((p,i)=>{ p.cool=0; p.swingT=0; p.x=p.tx=homeX(i); p.z=p.tz=side(i)*5.5; });
+}
 reset();
 
 // Aim the ball at a spot on the ground, slowing the shot until it clears the net.
@@ -68,12 +75,13 @@ function launch(tx,tz,speed){
 
 function point(w,why){
   S.live=false; S.score[w]++; S.server=w; S.timer=1.5; S.msg=why;
+  S.serverP=S.n===4?w+2*((S.score[0]+S.score[1])%2):w;   // doubles partners take turns serving
   const [a,c]=S.score;
   if(Math.max(a,c)>=11&&Math.abs(a-c)>=2){ S.over=true; S.timer=5; }
 }
 
 // Is the ball close enough for player i to reach, and would hitting it now be legal?
-function near(i){ const p=S.p[i], b=S.b; return S.live&&S.last!==i&&Math.sign(b.z)===side(i)&&b.y>.25&&b.y<2.4&&Math.hypot(b.x-p.x,b.z-p.z)<REACH; }
+function near(i){ const p=S.p[i], b=S.b; return S.live&&S.last%2!==i%2&&Math.sign(b.z)===side(i)&&b.y>.25&&b.y<2.4&&Math.hypot(b.x-p.x,b.z-p.z)<REACH; }
 // Legal hit: after one bounce, or a volley once serve and return have both bounced and you're out of the kitchen.
 const legal=i=>S.bounces||(S.hits>=3&&Math.abs(S.p[i].z)>KITCHEN);
 function mark(i,kind,back){ S.sw[i]++; S.kind[i]=kind; S.backs[i]=back; }   // tells the drawing code to play a swing
@@ -88,15 +96,16 @@ function swing(i){
 function step(dt){
   if(S.over){ if((S.timer-=dt)<=0) reset(); return; }
   S.p.forEach((p,i)=>{                       // walk toward the target, kept on your own half
+    if(i>=S.n) return;
     p.cool-=dt; p.swingT-=dt;
     const s=side(i), dx=clamp(p.tx,-HW-1.5,HW+1.5)-p.x, dz=s*clamp(s*p.tz,.4,HL+1.5)-p.z, d=Math.hypot(dx,dz);
     if(d>1e-6){ const m=Math.min(d,p.speed*dt)/d; p.x+=dx*m; p.z+=dz*m; }
   });
   const b=S.b;
   if(!S.live){                               // server holds the ball, then serves cross-court
-    const sv=S.p[S.server]; b.x=sv.x; b.y=1; b.z=sv.z;
+    const sv=S.p[S.serverP]; b.x=sv.x; b.y=1; b.z=sv.z;
     if((S.timer-=dt)<=0){
-      S.live=true; S.last=S.server; S.bounces=0; S.hits=1; S.msg=''; S.shot='Serve'; mark(S.server,'Serve',false);
+      S.live=true; S.last=S.serverP; S.bounces=0; S.hits=1; S.msg=''; S.shot='Serve'; mark(S.serverP,'Serve',false);
       launch(clamp(-sv.x*.6,-2,2),-side(S.server)*5,11);
     }
     return;
@@ -104,13 +113,16 @@ function step(dt){
   b.x+=b.vx*dt; b.z+=b.vz*dt; b.y+=b.vy*dt-G*dt*dt/2; b.vy-=G*dt;
   if(b.y<=BR){
     const good=Math.abs(b.x)<=HW&&Math.abs(b.z)<=HL&&Math.sign(b.z)===-side(S.last);
-    if(S.bounces||!good) return point(S.bounces?S.last:1-S.last, S.bounces?'':'Out!');
+    if(S.bounces||!good) return point(S.bounces?S.last%2:1-S.last%2, S.bounces?'':'Out!');
     S.bounces=1; b.y=BR; b.vy*=-.72; b.vx*=.8; b.vz*=.8;
   }
-  const i=1-S.last, p=S.p[i], s=side(i), off=b.x-p.x;
-  if(near(i)&&legal(i)&&(p.auto||p.swingT>0)){   // the computer swings by itself; a human must have pressed hit
+  // The computer swings by itself; a human must have pressed hit. If both partners are ready, the nearer one takes it.
+  const dist=j=>Math.hypot(b.x-S.p[j].x,b.z-S.p[j].z);
+  const ready=[0,1,2,3].filter(j=>j<S.n&&near(j)&&legal(j)&&(S.p[j].auto||S.p[j].swingT>0)).sort((a,c)=>dist(a)-dist(c));
+  if(ready.length){
+    const i=ready[0], p=S.p[i], s=side(i), off=b.x-p.x;
     // The shot is chosen by the situation: high ball = smash, you at the net = dink, opponent at the net = lob.
-    const mine=Math.abs(p.z), theirs=Math.abs(S.p[S.last].z);
+    const mine=Math.abs(p.z), theirs=Math.min(...S.p.filter((q,j)=>j<S.n&&j%2!==i%2).map(q=>Math.abs(q.z)));
     const [shot,speed,depth]= b.y>1.4 ? ['Smash',19,4.6] : mine<3.2 ? ['Dink',5,1.3] : theirs<3.2 ? ['Lob',5.5,5.8]
                             : S.bounces ? ['Drive',10,clamp(mine*.85,3,5.6)] : ['Volley',13,clamp(mine*.85,3,5.6)];
     S.shot=shot; S.back=off*s<0;             // ball on the non-paddle side = backhand
@@ -121,10 +133,12 @@ function step(dt){
 }
 
 function ai(i){
-  const p=S.p[i], s=side(i);
+  const p=S.p[i], s=side(i), mate=S.p[(i+2)%4], d=q=>Math.hypot(S.land.x-q.x,S.land.z-q.z);
+  // In doubles only the partner nearer the ball chases it; the other holds their side.
+  const mine=S.n===2||d(p)<d(mate)||(d(p)===d(mate)&&i<2);
   // Receiving: stand just past the bounce, but get under a lob to smash it. Otherwise wait deep, or sometimes rush the net.
-  if(S.live&&S.last!==i){ p.tx=S.land.x+S.err; p.tz=S.land.z-(S.shot==='Lob'?s*1.2:0); }
-  else { p.tx=0; p.tz=s*(S.hits>=3&&S.err>.3?2.6:5); }
+  if(S.live&&S.last%2!==i%2&&mine){ p.tx=S.land.x+S.err; p.tz=S.land.z-(S.shot==='Lob'?s*1.2:0); }
+  else { p.tx=homeX(i); p.tz=s*(S.hits>=3&&S.err>.3?2.6:5); }
 }
 
 function selfCheck(){
@@ -134,11 +148,15 @@ function selfCheck(){
   for(let n=0;b.y>BR&&n<600;n++){ const z0=b.z, dt=1/60;
     b.x+=b.vx*dt; b.z+=b.vz*dt; b.y+=b.vy*dt-G*dt*dt/2; b.vy-=G*dt; if(z0>0&&b.z<=0) netY=b.y; }
   ok(Math.hypot(b.x+2,b.z+4)<.25,'shot lands on target'); ok(netY>NET,'shot clears the net');
-  reset(); S.p[0].speed=S.p[1].speed=3.5; S.p[0].auto=S.p[1].auto=true;
-  const shots={}; let t=0, h=0;
-  for(;!S.over&&t<36000;t+=1/60){ ai(0); ai(1); step(1/60); if(S.hits>h&&S.hits>1) shots[S.shot]=(shots[S.shot]|0)+1; h=S.hits; }
-  const [a,c]=S.score; ok(S.over&&Math.max(a,c)>=11&&Math.abs(a-c)>=2,`full game finishes (${a}-${c})`);
-  return `self-check ok: ${a}-${c} after ${Math.round(t)}s of play, shots ${JSON.stringify(shots)}`;
+  const play=n=>{                             // the computer plays itself to the end of a game
+    S.n=n; reset(); S.p.forEach(p=>{ p.speed=3.5; p.auto=true; });
+    const shots={}; let t=0, h=0;
+    for(;!S.over&&t<36000;t+=1/60){ for(let i=0;i<n;i++) ai(i); step(1/60); if(S.hits>h&&S.hits>1) shots[S.shot]=(shots[S.shot]|0)+1; h=S.hits; }
+    const [a,c]=S.score; ok(S.over&&Math.max(a,c)>=11&&Math.abs(a-c)>=2,`full ${n}-player game finishes (${a}-${c})`);
+    return `${n} players: ${a}-${c} after ${Math.round(t)}s, shots ${JSON.stringify(shots)}`;
+  };
+  const r=[play(2),play(4)]; S.n=2;
+  return 'self-check ok. '+r.join(' | ');
 }
 
 // ---------- drawing ----------
@@ -162,7 +180,7 @@ for(const s of [1,-1]){
 }
 add(new THREE.PlaneGeometry(HW*2+.6,NET),new THREE.MeshLambertMaterial({color:0xffffff,transparent:true,opacity:.45,side:THREE.DoubleSide}),0,NET/2,0);
 add(new THREE.BoxGeometry(HW*2+.6,.06,.04),mat(0xffffff),0,NET,0);
-const men=[0xffb703,0xe63946].map((c,i)=>{
+const men=[0xffb703,0xe63946,0xffb703,0xe63946].map((c,i)=>{
   // A person built from simple shapes; limbs hang from pivots (hips, shoulders) so they can swing.
   const g=new THREE.Group(), skin=mat(0xe8b88f), dark=mat(0x26324a);
   const part=(parent,geo,m,x,y,z=0)=>{ const o=new THREE.Mesh(geo,m); o.position.set(x,y,z); parent.add(o); return o; };
@@ -183,12 +201,14 @@ const men=[0xffb703,0xe63946].map((c,i)=>{
   part(hand,new THREE.CylinderGeometry(.02,.02,.14),dark,0,-.64);
   const face=part(hand,new THREE.CylinderGeometry(.15,.15,.025,20),mat(0x1b1b1b),0,-.84);
   face.rotation.x=Math.PI/2; face.scale.x=.8;
-  g.traverse(o=>o.castShadow=true); if(i) g.rotation.y=Math.PI; scene.add(g);
-  g.userData={limbs,phase:0,amp:0,swing:0,px:0,pz:0,seenSw:0,kind:'Drive'}; return g;
+  g.traverse(o=>o.castShadow=true); if(i%2) g.rotation.y=Math.PI; scene.add(g);
+  const ring=add(new THREE.RingGeometry(.42,.54,32),new THREE.MeshBasicMaterial({color:c})); ring.rotation.x=-Math.PI/2;
+  g.userData={limbs,ring,phase:0,amp:0,swing:0,px:0,pz:0,seenSw:0,kind:'Drive'}; return g;
 });
 // Realistic players: rigged models with a run clip. The shape-built figures above stay as the fallback
 // if a model fails to load (for example when the page is opened as a file instead of from a web address).
-['man','woman'].forEach((name,i)=>new GLTFLoader().load(`models/${name}.glb`,g=>{
+THREE.Cache.enabled=true;                    // each model file downloads once and is used twice
+['man','woman','woman','man'].forEach((name,i)=>new GLTFLoader().load(`models/${name}.glb`,g=>{
   const root=men[i], u=root.userData, m=g.scene;
   root.children.forEach(c=>c.visible=false);
   m.rotation.y=Math.PI;                       // models face +z; players face the net
@@ -299,26 +319,31 @@ function view(){
 const setText=(el,t)=>{ if(el.textContent!==t) el.textContent=t; };
 function draw(dt){
   animate(dt);
-  S.p.forEach((p,i)=>men[i].position.set(p.x,0,p.z));
+  S.p.forEach((p,i)=>{
+    const g=men[i], r=g.userData.ring; g.visible=r.visible=i<S.n;
+    g.position.set(p.x,0,p.z); r.position.set(p.x,.045,p.z);
+    r.material.color.set(mode&&mode!=='local'&&i===me?0xffffff:i%2?0xe63946:0xffb703);   // white ring = you, colour = team
+  });
   ball.position.set(S.b.x,S.b.y,S.b.z);
   if(mode){
-    const names=mode==='local'?['Near','Far']:me?['Opponent','You']:['You','Opponent'];
+    const mine=S.n===4?'Us':'You', theirs=S.n===4?'Them':'Opponent';
+    const names=mode==='local'?['Near','Far']:me%2?[theirs,mine]:[mine,theirs];
     const w=S.score[0]>S.score[1]?0:1;
     setText($('score'),`${names[0]} ${S.score[0]} – ${S.score[1]} ${names[1]}`);
-    setText($('msg'),S.over?(mode==='local'?`${names[w]} side wins!`:w===me?'You win!':'You lose'):String(S.msg||''));
+    setText($('msg'),S.over?(mode==='local'?`${names[w]} side wins!`:w===me%2?'You win!':'You lose'):String(S.msg||''));
   }
   renderer.render(scene,camera);
 }
 
 // ---------- input ----------
 const ray=new THREE.Raycaster(), ndc=new THREE.Vector2(), pt=new THREE.Vector3(), floor=new THREE.Plane(new THREE.Vector3(0,1,0),0);
-const mover=[null,null];                      // which finger steers each player; any extra tap is just a hit
+const mover=[null,null,null,null];                      // which finger steers each player; any extra tap is just a hit
 function hitKey(i){ if(mode==='guest'){ if(conn?.open) conn.send({swing:1}); } else swing(i); }
 function aim(e){
   if(!mode) return;
   ndc.set(e.clientX/innerWidth*2-1,-e.clientY/innerHeight*2+1); ray.setFromCamera(ndc,camera);
   if(!ray.ray.intersectPlane(floor,pt)) return;
-  const i=mode==='guest'||(mode==='local'&&pt.z<0)?1:0;          // on one device, each half steers its own player
+  const i=mode==='local'?(pt.z<0?1:0):me;                       // on one device, each half steers its own player
   if(e.type==='pointerdown'){ if(mover[i]===null) mover[i]=e.pointerId; if($('hit').hidden) hitKey(i); }   // with the HIT button showing, touching the court only moves
   if(e.pointerType!=='mouse'&&mover[i]!==e.pointerId) return;
   if(mode==='guest'){ if(conn?.open) conn.send({x:pt.x,z:pt.z}); return; }
@@ -331,7 +356,7 @@ const keys={}; addEventListener('keyup',e=>keys[e.code]=0);
 addEventListener('keydown',e=>{
   keys[e.code]=1;
   if(!mode||e.repeat) return;
-  if(e.code==='Space'||e.code==='Enter'){ e.preventDefault(); hitKey(mode==='guest'?1:0); }
+  if(e.code==='Space'||e.code==='Enter'){ e.preventDefault(); hitKey(me); }
   if(e.code==='KeyF'&&mode==='local') hitKey(1);
 });
 function keyMove(i,l,r,u,d){
@@ -340,65 +365,94 @@ function keyMove(i,l,r,u,d){
 }
 
 // ---------- modes + online ----------
-function start(m){
-  mode=m; me=m==='guest'?1:0; reset();
-  S.p[1].speed=m==='solo'?3.5:5.5; S.p[0].auto=false; S.p[1].auto=m==='solo';
-  $('menu').hidden=true; $('menu').style.display='none'; view();
+let conns=[];                                // host only: the connection for each guest's player number
+function start(m,n=2,seat=0){
+  mode=m; me=seat; S.n=n; reset();
+  // Any spot without a human in it is played by the computer.
+  S.p.forEach((p,i)=>{ p.auto=m==='solo'?i>0:m==='host'?i>0&&!conns[i]?.open:false; p.speed=p.auto?3.5:5.5; });
+  $('menu').hidden=true; $('menu').style.display='none'; $('go').hidden=true; view();
   $('hit').hidden=!(matchMedia('(pointer:coarse)').matches&&m!=='local');   // phones and tablets get a HIT button
 }
 function back(text){
-  mode=null; conn=null; peer?.destroy(); peer=null; $('hit').hidden=true;
+  mode=null; conn=null; conns=[]; peer?.destroy(); peer=null; $('hit').hidden=$('go').hidden=true;
   $('menu').style.display=''; $('menu').hidden=false; $('status').textContent=text; $('score').textContent=$('msg').textContent='';
 }
 const netError=e=>back(e.type==='peer-unavailable'?'No game found with that code.':'Connection problem ('+e.type+'). Try again.');
 $('solo').onclick=()=>start('solo');
+$('solo2').onclick=()=>start('solo',4);
 $('local').onclick=()=>start('local');
-$('host').onclick=()=>{
+function host(n){
   if(!window.Peer) return $('status').textContent='Online play needs an internet connection.';
   const code=Array.from({length:4},()=>'ABCDEFGHJKLMNPQRSTUVWXYZ'[Math.random()*24|0]).join('');
-  peer?.destroy(); peer=new Peer('pickle3d-'+code);
-  peer.on('open',()=>$('status').textContent=`Room code: ${code}. Waiting for your friend to join…`);
-  peer.on('error',netError);
+  const seats=n===4?[2,1,3]:[1];             // doubles: the first friend to join is your partner, the next two are the other team
+  conns=[]; peer?.destroy(); peer=new Peer('pickle3d-'+code);
+  const lobby=()=>{
+    $('go').hidden=n!==4;
+    $('status').textContent=n===2?`Room code: ${code}. Waiting for your friend to join…`
+      :`Room code: ${code}. ${conns.filter(c=>c?.open).length+1} of 4 players here. Press Start when ready; the computer plays any empty spot.`;
+  };
+  const begin=()=>{ start('host',n); conns.forEach((c,seat)=>{ if(c?.open) c.send({start:1,seat,n}); }); };
+  $('go').onclick=begin;
+  peer.on('open',lobby); peer.on('error',netError);
   peer.on('connection',c=>{
-    if(conn?.open) return c.close();          // one guest only
-    conn=c;
-    c.on('open',()=>start('host'));
-    c.on('data',d=>{ if(d?.swing) swing(1); else if(Number.isFinite(d?.x)&&Number.isFinite(d?.z)){ S.p[1].tx=d.x; S.p[1].tz=d.z; } });
-    c.on('close',()=>back('Your friend left the game.'));
+    const seat=seats.find(k=>!conns[k]);
+    if(seat===undefined) return c.close();    // room is full
+    conns[seat]=c;
+    c.on('open',()=>{
+      if(mode==='host'){ S.p[seat].auto=false; S.p[seat].speed=5.5; c.send({start:1,seat,n}); }   // joined mid-match: take over from the computer
+      else if(n===2) begin(); else lobby();
+    });
+    c.on('data',d=>{
+      if(mode!=='host') return;
+      if(d?.swing) swing(seat); else if(Number.isFinite(d?.x)&&Number.isFinite(d?.z)){ S.p[seat].tx=d.x; S.p[seat].tz=d.z; }
+    });
+    c.on('close',()=>{
+      conns[seat]=null;
+      if(mode!=='host'){ if(peer) lobby(); }
+      else if(n===2) back('Your friend left the game.');
+      else { S.p[seat].auto=true; S.p[seat].speed=3.5; }                                          // the computer takes over their spot
+    });
   });
-};
+}
+$('host').onclick=()=>host(2);
+$('host4').onclick=()=>host(4);
 $('join').onclick=()=>{
   const code=$('code').value.trim().toUpperCase();
   if(!/^[A-Z]{4}$/.test(code)) return $('status').textContent='Type the 4-letter room code first.';
   if(!window.Peer) return $('status').textContent='Online play needs an internet connection.';
-  $('status').textContent='Connecting…';
+  $('status').textContent='Connecting…'; $('go').hidden=true;
   peer?.destroy(); peer=new Peer();
   peer.on('error',netError);
   peer.on('open',()=>{
     conn=peer.connect('pickle3d-'+code,{serialization:'json'});
-    conn.on('open',()=>start('guest'));
-    conn.on('data',d=>{                        // host owns the game; guest just shows it
-      d.p.forEach((q,i)=>{ S.p[i].x=+q.x; S.p[i].z=+q.z; });
+    conn.on('open',()=>$('status').textContent='Joined. Waiting for the host to start…');
+    conn.on('data',d=>{                        // host owns the game; guests just show it
+      if(d?.start) return start('guest',d.n===4?4:2,[1,2,3].includes(d.seat)?d.seat:1);
+      if(mode!=='guest') return;
+      d.p.forEach((q,i)=>{ if(S.p[i]){ S.p[i].x=+q.x; S.p[i].z=+q.z; } });
       Object.assign(S.b,{x:+d.b.x,y:+d.b.y,z:+d.b.z}); S.score=[+d.score[0],+d.score[1]]; S.over=!!d.over; S.msg=d.msg;
-      S.hits=d.hits|0; S.last=d.last===1?1:0; S.bounces=d.bounces|0; S.shot=String(d.shot); S.back=!!d.back;
-      S.sw=[d.sw[0]|0,d.sw[1]|0]; S.kind=d.kind.map(k=>POSES[k]?k:'Drive'); S.backs=d.backs.map(Boolean);
+      S.hits=d.hits|0; S.last=clamp(d.last|0,-1,3); S.bounces=d.bounces|0; S.shot=String(d.shot); S.back=!!d.back;
+      S.sw=d.sw.map(v=>v|0); S.kind=d.kind.map(k=>POSES[k]?k:'Drive'); S.backs=d.backs.map(Boolean);
     });
     conn.on('close',()=>back('The host left the game.'));
   });
 };
 
-// shortcut: host sends the whole state every frame and the guest draws it as-is (no smoothing), and a host tab
+// shortcut: host sends the whole state every frame and the guests draw it as-is (no smoothing), and a host tab
 // in the background pauses the match. Upgrade to interpolation + a fixed tick if online play feels jumpy.
 let prev=performance.now();
 function frame(now){
   requestAnimationFrame(frame);
   const dt=Math.min((now-prev)/1000,.05); prev=now;
   if(mode&&mode!=='guest'){
-    if(mode==='solo') ai(1);
+    S.p.forEach((p,i)=>{ if(i<S.n&&p.auto) ai(i); });
     keyMove(0,'ArrowLeft','ArrowRight','ArrowUp','ArrowDown');
     if(mode==='local') keyMove(1,'KeyA','KeyD','KeyW','KeyS');
     step(dt);
-    if(mode==='host'&&conn?.open) conn.send({p:S.p.map(({x,z})=>({x,z})),b:S.b,score:S.score,over:S.over,msg:S.msg,hits:S.hits,last:S.last,bounces:S.bounces,shot:S.shot,back:S.back,sw:S.sw,kind:S.kind,backs:S.backs});
+    if(mode==='host'){
+      const snap={p:S.p.map(({x,z})=>({x,z})),b:S.b,score:S.score,over:S.over,msg:S.msg,hits:S.hits,last:S.last,bounces:S.bounces,shot:S.shot,back:S.back,sw:S.sw,kind:S.kind,backs:S.backs};
+      conns.forEach(c=>{ if(c?.open) c.send(snap); });
+    }
   }
   draw(dt);
 }
