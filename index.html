@@ -41,10 +41,15 @@
   <p>On one device: drag in your own half and tap with another finger to hit. Keyboard: arrows + Space (near side), WASD + F (far side).</p>
 </div>
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script>
+  // Say so on screen while loading, and show why if loading fails, so the menu is never silently dead.
+  document.getElementById('status').textContent='Loading game…';
+  addEventListener('error',function(e){ if(!window.gameReady) document.getElementById('status').textContent='The game could not load ('+(e.message||'a file failed to download')+'). Check your connection and reload the page.'; },true);
+</script>
 <script type="module">
-import * as THREE from 'three';
-import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+// Full web addresses instead of an import map: import maps don't exist on iPhones before iOS 16.4.
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/+esm';
+import {GLTFLoader} from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js/+esm';
 
 // ---------- rules + physics (no drawing in here) ----------
 const HW=3.05, HL=6.7, NET=.91, KITCHEN=2.13, G=9.8, BR=.09, REACH=1.2; // metres, real court size
@@ -459,6 +464,7 @@ function frame(now){
 if(location.search==='?test'){ let r; try{ r=selfCheck(); }catch(e){ r=e.message; } console.log(r); $('status').textContent=r; reset(); }
 if(location.search.startsWith('?debug')) window.dbg={camera,men,S,swing};   // for close-up inspection from the console
 view(); requestAnimationFrame(frame);
+window.gameReady=true; if($('status').textContent==='Loading game…') $('status').textContent='';
 </script>
 </body>
 </html>
